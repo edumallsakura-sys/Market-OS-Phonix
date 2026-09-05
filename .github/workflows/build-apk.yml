@@ -1,0 +1,156 @@
+name: Universal Android ZIP Builder v12
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '**/*.zip'
+      - '**/*.gradle'
+      - '**/*.gradle.kts'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Prepare and extract Android projects
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import os, zipfile, shutil
+          repo=Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          work=Path(os.environ['RUNNER_TEMP'])/'android_projects'
+          shutil.rmtree(work, ignore_errors=True); work.mkdir(parents=True)
+          repo_copy=work/'000_repo'
+          shutil.copytree(repo, repo_copy, ignore=shutil.ignore_patterns('.git'))
+          roots=[repo_copy]
+          zips=[p for p in repo.rglob('*.zip') if '.git' not in p.parts]
+          print('ZIP files found:',len(zips))
+          def extract(z,d):
+              d.mkdir(parents=True,exist_ok=True); base=d.resolve()
+              with zipfile.ZipFile(z) as q:
+                  for info in q.infolist():
+                      target=(d/info.filename).resolve()
+                      if os.path.commonpath([str(base),str(target)])!=str(base):
+                          raise RuntimeError('Unsafe ZIP entry: '+info.filename)
+                  q.extractall(d)
+              print('Extracted',z,'->',d)
+          for i,z in enumerate(zips,1):
+              d=work/f'{i:03d}_{z.stem}'; extract(z,d); roots.append(d)
+          seen=set()
+          for depth in range(5):
+              nested=[]
+              for root in list(roots):
+                  for z in root.rglob('*.zip'):
+                      k=str(z.resolve())
+                      if k not in seen: seen.add(k); nested.append(z)
+              if not nested: break
+              made=[]
+              for i,z in enumerate(nested,1):
+                  d=z.parent/f'__unzipped_{depth+1}_{i}_{z.stem}'
+                  if d.exists(): continue
+                  extract(z,d); made.append(d)
+              roots.extend(made)
+          PY
+
+      - name: Detect Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+          import os,re
+          work=Path(os.environ['RUNNER_TEMP'])/'android_projects'
+          cand=[]
+          for settings in list(work.rglob('settings.gradle'))+list(work.rglob('settings.gradle.kts')):
+              root=settings.parent; score=0; markers=[]
+              if (root/'gradlew').exists(): score+=100
+              if (root/'gradle/wrapper/gradle-wrapper.jar').exists(): score+=60
+              if (root/'app/build.gradle').exists() or (root/'app/build.gradle.kts').exists(): score+=60
+              for f in list(root.rglob('build.gradle'))+list(root.rglob('build.gradle.kts')):
+                  try: t=f.read_text(errors='ignore')
+                  except: continue
+                  if any(x in t for x in ('com.android.application','com.android.library','com.android.dynamic-feature')): markers.append(f)
+              if markers: cand.append((score+250,-len(root.parts),root,markers[0]))
+          if not cand:
+              print('ERROR: No Android Gradle project found')
+              for i,p in enumerate(sorted(work.rglob('*'))):
+                  if i>=300: break
+                  try: print(p.relative_to(work))
+                  except: pass
+              raise SystemExit(1)
+          cand.sort(reverse=True,key=lambda x:(x[0],x[1]))
+          _,_,root,marker=cand[0]
+          compile_sdk='35'
+          for f in [root/'app/build.gradle',root/'app/build.gradle.kts',root/'build.gradle',root/'build.gradle.kts']:
+              if not f.exists(): continue
+              t=f.read_text(errors='ignore')
+              m=re.search(r'compileSdk(?:Version)?\s*[= ]\s*["\']?(\d+)',t)
+              if m: compile_sdk=m.group(1); break
+          print('Selected:',root); print('Marker:',marker); print('compileSdk:',compile_sdk)
+          with open(os.environ['GITHUB_ENV'],'a') as e:
+              e.write(f'PROJECT_DIR={root}\nCOMPILE_SDK={compile_sdk}\n')
+          PY
+
+      - name: Install required Android SDK platform
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-${COMPILE_SDK}" "build-tools;35.0.0"
+
+      - name: Set up fallback Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          if [ -f gradlew ] && [ -f gradle/wrapper/gradle-wrapper.jar ]; then
+            chmod +x gradlew
+            ./gradlew assembleDebug --stacktrace --no-daemon
+          else
+            gradle assembleDebug --stacktrace --no-daemon
+          fi
+
+      - name: Collect APK files
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/apk_artifacts"; rm -rf "$OUT"; mkdir -p "$OUT"
+          mapfile -t APKS < <(find "$PROJECT_DIR" -type f -name '*.apk' -path '*/build/outputs/apk/*' ! -name '*androidTest*.apk' -print)
+          [ "${#APKS[@]}" -gt 0 ] || { echo 'ERROR: no APK found'; exit 1; }
+          i=0; for apk in "${APKS[@]}"; do i=$((i+1)); cp "$apk" "$OUT/${i}_$(basename "$apk")"; done
+          echo "APK_OUTPUT_DIR=$OUT" >> "$GITHUB_ENV"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MarketOS-v9-Android-APKs
+          path: ${{ env.APK_OUTPUT_DIR }}/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          
