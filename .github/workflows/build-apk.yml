@@ -28,7 +28,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          INPUT_ZIP="${{ github.event.inputs.zip_path || '' }}"
+          INPUT_ZIP="${{ inputs.zip_path || '' }}"
 
           if [ -n "$INPUT_ZIP" ]; then
             if [ ! -f "$INPUT_ZIP" ]; then
@@ -37,7 +37,6 @@ jobs:
             fi
             ZIPS="$INPUT_ZIP"
           else
-            # Tìm tất cả file .zip trong repo, bỏ qua thư mục .git
             mapfile -t ZIP_LIST < <(find . -type f -iname '*.zip' -not -path './.git/*' | sed 's|^\./||' | sort)
             if [ ${#ZIP_LIST[@]} -eq 0 ]; then
               echo "ERROR: không tìm thấy file .zip nào trong repo." >&2
@@ -49,7 +48,6 @@ jobs:
           echo "ZIP files được chọn:"
           echo "$ZIPS"
 
-          # Tạo matrix JSON
           JSON=$(printf '%s\n' "$ZIPS" | python3 -c '
           import sys, json
           lines = [l.strip() for l in sys.stdin if l.strip()]
@@ -112,7 +110,7 @@ jobs:
         with:
           gradle-version: '8.9'
 
-      - name: Extract ZIP và tìm project Android
+      - name: Extract ZIP và tìm project Android (đệ quy)
         id: prep
         shell: bash
         run: |
@@ -124,42 +122,90 @@ jobs:
           mkdir -p "$WORK/extracted"
           unzip -q "$ZIP_FILE" -d "$WORK/extracted"
 
-          # Tìm settings.gradle hoặc settings.gradle.kts ở bất kỳ độ sâu nào
-          SETTINGS_FILE="$(find "$WORK/extracted" -type f \( -name settings.gradle -o -name settings.gradle.kts \) | head -1 || true)"
-          test -n "$SETTINGS_FILE" || {
-            echo "ERROR: không tìm thấy settings.gradle(.kts) trong $ZIP_FILE" >&2
-            find "$WORK/extracted" -maxdepth 3 -type f | head -50
-            exit 1
-          }
-          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "SETTINGS_FILE=$SETTINGS_FILE" >> "$GITHUB_ENV"
-          echo "Project: $PROJECT_DIR"
+          python3 - "$WORK/extracted" "$WORK/nested" <<'PYEOF'
+          import os, zipfile, sys
 
-          # Trỏ SDK cho Gradle
-          echo "sdk.dir=$ANDROID_HOME" > "$PROJECT_DIR/local.properties"
+          outer_dir = sys.argv[1]
+          work_dir = sys.argv[2]
 
-          # Cấp quyền chạy wrapper nếu có
-          if [ -f "$PROJECT_DIR/gradlew" ]; then chmod +x "$PROJECT_DIR/gradlew"; fi
+          def find_settings(root):
+              for dirpath, _, filenames in os.walk(root):
+                  for f in filenames:
+                      if f in ('settings.gradle', 'settings.gradle.kts'):
+                          return os.path.join(dirpath, f)
+              return None
 
-      - name: Static preflight (kiểm tra file quan trọng nếu có)
+          def extract_nested(root, out_root, level=1):
+              zips = []
+              for dirpath, _, filenames in os.walk(root):
+                  for f in filenames:
+                      if f.lower().endswith('.zip'):
+                          zips.append(os.path.join(dirpath, f))
+              
+              if not zips:
+                  return None
+              
+              print(f"--- Level {level}: found {len(zips)} nested zip(s)")
+              extracted_paths = []
+              for i, z in enumerate(zips):
+                  out_dir = os.path.join(out_root, f"lvl{level}_{i}")
+                  os.makedirs(out_dir, exist_ok=True)
+                  try:
+                      with zipfile.ZipFile(z, 'r') as zip_ref:
+                          zip_ref.extractall(out_dir)
+                      extracted_paths.append(out_dir)
+                      print(f"  Extracted: {z} -> {out_dir}")
+                  except Exception as e:
+                      print(f"  FAILED to extract {z}: {e}", file=sys.stderr)
+              
+              for p in extracted_paths:
+                  s = find_settings(p)
+                  if s:
+                      return s
+              
+              for p in extracted_paths:
+                  s = extract_nested(p, out_root, level+1)
+                  if s:
+                      return s
+              
+              return None
+
+          settings_file = find_settings(outer_dir)
+          if settings_file:
+              print(f"Found settings at outer level: {settings_file}")
+          else:
+              print("Not found at outer level. Starting nested extraction...")
+              settings_file = extract_nested(outer_dir, work_dir)
+
+          if settings_file:
+              project_dir = os.path.dirname(settings_file)
+              with open(os.environ['GITHUB_ENV'], 'a') as f:
+                  f.write(f"PROJECT_DIR={project_dir}\n")
+                  f.write(f"SETTINGS_FILE={settings_file}\n")
+              print(f"SUCCESS: Found project dir: {project_dir}")
+          else:
+              print("ERROR: Could not find settings.gradle in any extracted content", file=sys.stderr)
+              sys.exit(1)
+          PYEOF
+
+      - name: Static preflight
         shell: bash
         run: |
           set -euo pipefail
-          # Kiểm tra mềm dẻo: chỉ fail nếu có bằng chứng rõ ràng
-          if [ -f "$PROJECT_DIR/app/src/main/assets/index.html" ]; then
+          cd "$PROJECT_DIR"
+
+          if [ -f "app/src/main/assets/index.html" ]; then
             echo "index.html OK"
           else
             echo "Cảnh báo: không có app/src/main/assets/index.html (bỏ qua)."
           fi
 
-          if [ -f "$PROJECT_DIR/static_audit.py" ]; then
-            python3 "$PROJECT_DIR/static_audit.py" || echo "static_audit.py báo lỗi (đã ghi nhận, tiếp tục)."
+          if [ -f "static_audit.py" ]; then
+            python3 static_audit.py || echo "static_audit.py báo lỗi (đã ghi nhận, tiếp tục)."
           fi
 
-          # Nếu có index.html với <script> inline, chạy node --check
-          if [ -f "$PROJECT_DIR/app/src/main/assets/index.html" ]; then
-            python3 - "$PROJECT_DIR/app/src/main/assets/index.html" <<'PYJS'
+          if [ -f "app/src/main/assets/index.html" ]; then
+            python3 - "app/src/main/assets/index.html" <<'PYJS'
           import re,sys,pathlib
           h=pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
           m=re.search(r'<script>(.*)</script>',h,re.S)
