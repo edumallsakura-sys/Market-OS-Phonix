@@ -13,7 +13,6 @@ permissions:
 
 jobs:
   build:
-    # Pin the runner image so the preinstalled Android toolchain is predictable.
     runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
@@ -31,20 +30,30 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # IMPORTANT: do NOT call android-actions/setup-android or sdkmanager here.
-      # GitHub's ubuntu-24.04 image already contains Android platform 35 and
-      # build-tools 35.x. This avoids the cmdline-tools/sdkmanager failure.
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
       - name: Verify preinstalled Android SDK 35
         shell: bash
         run: |
           set -euo pipefail
           echo "ANDROID_HOME=$ANDROID_HOME"
           test -d "$ANDROID_HOME"
-          test -f "$ANDROID_HOME/platforms/android-35/android.jar"
-          test -d "$ANDROID_HOME/build-tools/35.0.0" || test -d "$ANDROID_HOME/build-tools/35.0.1"
-          echo "Android SDK 35 is already available; no sdkmanager call is needed."
+          test -f "$ANDROID_HOME/platforms/android-35/android.jar" || {
+            echo "ERROR: Android platform 35 not found at $ANDROID_HOME/platforms/android-35" >&2
+            ls "$ANDROID_HOME/platforms" || true
+            exit 1
+          }
+          if ! compgen -G "$ANDROID_HOME/build-tools/35.*" > /dev/null; then
+            echo "ERROR: build-tools 35.x not found at $ANDROID_HOME/build-tools" >&2
+            ls "$ANDROID_HOME/build-tools" || true
+            exit 1
+          fi
+          echo "Android SDK 35 is available."
 
-      - name: Set up Gradle 8.9
+      - name: Set up Gradle 8.9 (fallback if no wrapper)
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
@@ -55,7 +64,6 @@ jobs:
           set -euo pipefail
           test -f "$PHOENIX_SOURCE_ZIP" || {
             echo "ERROR: expected Phoenix source ZIP not found: $PHOENIX_SOURCE_ZIP" >&2
-            echo "Do not leave an old MarketOS V35 ZIP/workflow in place and rely on auto-detection." >&2
             find . -maxdepth 3 -type f | sort | head -200
             exit 1
           }
@@ -64,10 +72,20 @@ jobs:
           mkdir -p "$RUNNER_TEMP/phoenix_source"
           unzip -q "$PHOENIX_SOURCE_ZIP" -d "$RUNNER_TEMP/phoenix_source"
 
-          PROJECT_DIR="$(find "$RUNNER_TEMP/phoenix_source" -type f \( -name settings.gradle -o -name settings.gradle.kts \) -printf '%h\n' | head -1 || true)"
-          test -n "$PROJECT_DIR" || { echo 'ERROR: Phoenix Android settings.gradle not found.' >&2; exit 1; }
+          SETTINGS_FILE="$(find "$RUNNER_TEMP/phoenix_source" -type f \( -name settings.gradle -o -name settings.gradle.kts \) | head -1 || true)"
+          test -n "$SETTINGS_FILE" || { echo 'ERROR: Phoenix Android settings.gradle(.kts) not found.' >&2; exit 1; }
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "SETTINGS_FILE=$SETTINGS_FILE" >> "$GITHUB_ENV"
           echo "Phoenix project: $PROJECT_DIR"
+
+          # Ensure Gradle can find the SDK without relying on environment inheritance.
+          echo "sdk.dir=$ANDROID_HOME" > "$PROJECT_DIR/local.properties"
+
+          # Mark wrapper executable if present.
+          if [ -f "$PROJECT_DIR/gradlew" ]; then
+            chmod +x "$PROJECT_DIR/gradlew"
+          fi
 
       - name: Static preflight
         shell: bash
@@ -76,11 +94,28 @@ jobs:
           test -f "$PROJECT_DIR/app/src/main/assets/index.html"
           test -f "$PROJECT_DIR/app/src/main/java/com/marketos/phoenix/MainActivity.java"
           test -f "$PROJECT_DIR/app/src/main/java/com/marketos/phoenix/PdfViewerActivity.java"
-          grep -q 'MarketOSPhoenix' "$PROJECT_DIR/settings.gradle"
-          grep -q "compileSdk 35" "$PROJECT_DIR/app/build.gradle"
+
+          grep -q 'MarketOSPhoenix' "$SETTINGS_FILE"
+
+          APP_BUILD_FILE=""
+          if [ -f "$PROJECT_DIR/app/build.gradle" ]; then
+            APP_BUILD_FILE="$PROJECT_DIR/app/build.gradle"
+          elif [ -f "$PROJECT_DIR/app/build.gradle.kts" ]; then
+            APP_BUILD_FILE="$PROJECT_DIR/app/build.gradle.kts"
+          else
+            echo "ERROR: app/build.gradle(.kts) not found." >&2
+            exit 1
+          fi
+          grep -Eq 'compileSdk(Version)?[[:space:]]*(=)?[[:space:]]*35' "$APP_BUILD_FILE" || {
+            echo "ERROR: compileSdk 35 not found in $APP_BUILD_FILE" >&2
+            grep -n 'compileSdk' "$APP_BUILD_FILE" || true
+            exit 1
+          }
+
           if [ -f "$PROJECT_DIR/static_audit.py" ]; then
             python3 "$PROJECT_DIR/static_audit.py"
           fi
+
           python3 - "$PROJECT_DIR/app/src/main/assets/index.html" <<'PYJS'
           import re,sys,pathlib
           h=pathlib.Path(sys.argv[1]).read_text(encoding='utf-8')
@@ -95,7 +130,11 @@ jobs:
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
-          gradle :app:assembleDebug --stacktrace --no-daemon
+          if [ -x ./gradlew ]; then
+            ./gradlew :app:assembleDebug --stacktrace --no-daemon
+          else
+            gradle :app:assembleDebug --stacktrace --no-daemon
+          fi
 
       - name: Find APK
         shell: bash
@@ -111,5 +150,4 @@ jobs:
         with:
           name: MarketOS-Phoenix-v2.5-POLICY-DESK-debug-APK
           path: ${{ env.APK_PATH }}
-          if-no-files
-          -found: error
+          if-no-files-found: error
