@@ -1,12 +1,9 @@
-name: Build ALPHAFLOW OS v1.1.2 APK - PREINSTALLED SDK HOTFIX
+name: Build ALPHAFLOW OS v1.1.3 APK - ROBUST SOURCE AUTODISCOVERY
 
 on:
   workflow_dispatch:
   push:
     branches: [ main, master ]
-    paths:
-      - 'projects/ALPHAFLOW_OS_V1_1_2_SOURCE.zip'
-      - '.github/workflows/build-apk.yml'
 
 permissions:
   contents: read
@@ -16,7 +13,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
-      SOURCE_ZIP: projects/ALPHAFLOW_OS_V1_1_2_SOURCE.zip
       CI: '1'
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
@@ -36,63 +32,90 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22.13.1'
+          cache: npm
+          cache-dependency-path: '**/package.json'
 
-      # IMPORTANT:
-      # Do NOT use android-actions/setup-android here.
-      # ubuntu-24.04 already ships Android SDK 36 + Build Tools 36.0.0.
-      # The previous workflow failed inside setup-android's sdkmanager step.
       - name: Verify preinstalled Android SDK 36
         shell: bash
         run: |
           set -euo pipefail
           echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "JAVA_HOME=$JAVA_HOME"
           java -version
           node --version
           npm --version
-
           test -d "$ANDROID_HOME" || { echo "ERROR: ANDROID_HOME missing: $ANDROID_HOME"; exit 1; }
           test -f "$ANDROID_HOME/platforms/android-36/android.jar" || {
-            echo "ERROR: Android platform 36 is not preinstalled on this runner."
-            echo "Installed platforms:"
+            echo "ERROR: Android platform 36 is not preinstalled."
             ls -1 "$ANDROID_HOME/platforms" 2>/dev/null || true
             exit 1
           }
           test -d "$ANDROID_HOME/build-tools/36.0.0" || {
             echo "ERROR: Android Build Tools 36.0.0 are not preinstalled."
-            echo "Installed build-tools:"
             ls -1 "$ANDROID_HOME/build-tools" 2>/dev/null || true
             exit 1
           }
-          test -x "$ANDROID_HOME/platform-tools/adb" || {
-            echo "ERROR: Android platform-tools are missing."
-            exit 1
-          }
+          echo "Android SDK OK. No sdkmanager call is required."
 
-          echo "Android SDK 36 is already installed; sdkmanager intentionally not called."
-          echo "Build Tools: $(ls -1 "$ANDROID_HOME/build-tools" | tr '\n' ' ')"
-          echo "Platforms: $(ls -1 "$ANDROID_HOME/platforms" | grep -E '^android-(36|35)$' | tr '\n' ' ' || true)"
-          echo "NDKs: $(ls -1 "$ANDROID_HOME/ndk" 2>/dev/null | tr '\n' ' ' || true)"
-
-      - name: Extract Expo source and locate package.json
+      - name: Diagnose repository upload
         shell: bash
         run: |
           set -euo pipefail
-          test -f "$SOURCE_ZIP" || { echo "ERROR: Missing $SOURCE_ZIP"; exit 1; }
-          rm -rf "$RUNNER_TEMP/alphaflow_source"
-          mkdir -p "$RUNNER_TEMP/alphaflow_source"
-          unzip -q "$SOURCE_ZIP" -d "$RUNNER_TEMP/alphaflow_source"
+          echo '--- Repository files (depth <= 4) ---'
+          find "$GITHUB_WORKSPACE" -maxdepth 4 -type f \
+            -not -path '*/.git/*' | sed "s#^$GITHUB_WORKSPACE/##" | sort | head -400
 
-          PROJECT_DIR="$(find "$RUNNER_TEMP/alphaflow_source" -type f -name package.json -printf '%h\n' | head -1 || true)"
-          test -n "$PROJECT_DIR" || {
-            echo 'ERROR: package.json not found after extracting Expo source'
-            find "$RUNNER_TEMP/alphaflow_source" -maxdepth 4 -type f | sort
+      - name: Locate or extract Expo source automatically
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Mode A: user uploaded an unpacked Expo project directly to repository root.
+          if [[ -f "$GITHUB_WORKSPACE/package.json" && -f "$GITHUB_WORKSPACE/app.json" ]]; then
+            PROJECT_DIR="$GITHUB_WORKSPACE"
+            echo "Using unpacked Expo project at repository root."
+          else
+            # Mode B: preferred stable path used by ALPHAFLOW releases from v1.1.3 onward.
+            SOURCE_ZIP="$GITHUB_WORKSPACE/projects/ALPHAFLOW_OS_SOURCE.zip"
+
+            # Mode C: compatibility fallback for older versioned source ZIP names.
+            if [[ ! -f "$SOURCE_ZIP" ]]; then
+              SOURCE_ZIP="$(find "$GITHUB_WORKSPACE" -type f \( \
+                -iname 'ALPHAFLOW*SOURCE*.zip' -o \
+                -iname '*ALPHAFLOW*SOURCE*.zip' \
+              \) -not -path '*/.git/*' | sort | head -1 || true)"
+            fi
+
+            if [[ -z "${SOURCE_ZIP:-}" || ! -f "$SOURCE_ZIP" ]]; then
+              echo 'ERROR: No ALPHAFLOW Expo source was found.'
+              echo 'Expected preferred file: projects/ALPHAFLOW_OS_SOURCE.zip'
+              echo 'Upload ALL contents extracted from the ONECLICK package, not only build-apk.yml.'
+              echo 'ZIP files currently in repository:'
+              find "$GITHUB_WORKSPACE" -type f -iname '*.zip' -not -path '*/.git/*' -print || true
+              exit 1
+            fi
+
+            echo "Source ZIP selected: ${SOURCE_ZIP#$GITHUB_WORKSPACE/}"
+            rm -rf "$RUNNER_TEMP/alphaflow_source"
+            mkdir -p "$RUNNER_TEMP/alphaflow_source"
+            unzip -q "$SOURCE_ZIP" -d "$RUNNER_TEMP/alphaflow_source"
+
+            PROJECT_DIR="$(find "$RUNNER_TEMP/alphaflow_source" -type f -name package.json \
+              -not -path '*/node_modules/*' -printf '%h\n' | head -1 || true)"
+          fi
+
+          test -n "${PROJECT_DIR:-}" || {
+            echo 'ERROR: package.json not found in ALPHAFLOW source.'
             exit 1
           }
-          test -f "$PROJECT_DIR/app.json" || { echo 'ERROR: app.json not found beside package.json'; exit 1; }
+          test -f "$PROJECT_DIR/app.json" || {
+            echo "ERROR: app.json not found beside $PROJECT_DIR/package.json"
+            exit 1
+          }
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Expo project found at: $PROJECT_DIR"
+          echo '--- package version ---'
+          node -p "require('$PROJECT_DIR/package.json').version"
 
       - name: Static preflight before npm
         shell: bash
@@ -129,7 +152,6 @@ jobs:
           set -euo pipefail
           cd "$PROJECT_DIR"
           npx expo prebuild --platform android --clean --no-install
-
           test -d android || { echo 'ERROR: Expo prebuild did not create android/'; exit 1; }
           test -f android/settings.gradle -o -f android/settings.gradle.kts || {
             echo 'ERROR: settings.gradle missing AFTER Expo prebuild'
@@ -137,10 +159,6 @@ jobs:
             exit 1
           }
           test -f android/gradlew || { echo 'ERROR: Gradle wrapper missing after Expo prebuild'; exit 1; }
-
-          echo 'Android project generated successfully.'
-          echo '--- Android build properties ---'
-          grep -R -E 'compileSdk|targetSdk|buildTools|ndkVersion|minSdk' android/build.gradle android/app/build.gradle android/gradle.properties 2>/dev/null | head -100 || true
 
       - name: Build debug APK with generated Gradle wrapper
         shell: bash
@@ -160,8 +178,7 @@ jobs:
             find "$PROJECT_DIR/android/app/build/outputs" -maxdepth 6 -type f 2>/dev/null | sort || true
             exit 1
           }
-
-          FINAL_APK="$RUNNER_TEMP/ALPHAFLOW-OS-v1.1.2-debug.apk"
+          FINAL_APK="$RUNNER_TEMP/ALPHAFLOW-OS-v1.1.3-debug.apk"
           cp "$APK_PATH" "$FINAL_APK"
           echo "APK_PATH=$FINAL_APK" >> "$GITHUB_ENV"
           ls -lh "$FINAL_APK"
@@ -169,7 +186,7 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ALPHAFLOW-OS-v1.1.2-APK
+          name: ALPHAFLOW-OS-v1.1.3-APK
           path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 14
