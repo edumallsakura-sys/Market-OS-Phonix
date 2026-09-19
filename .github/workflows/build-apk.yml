@@ -1,4 +1,4 @@
-name: Build ALPHAFLOW OS v1.1.5 APK - OUTER ZIP AUTODISCOVERY
+name: Build ALPHAFLOW OS v1.1.6 APK - TYPESCRIPT NAV HOTFIX
 
 on:
   workflow_dispatch:
@@ -166,16 +166,29 @@ jobs:
               if resolved not in [p.resolve() for p in archives]:
                   archives.append(resolved)
 
-          # Prefer SOURCE archives, then ONECLICK archives, then any remaining ZIP.
+          # Prefer explicit SOURCE archives. If the repository contains several old
+          # versioned ALPHAFLOW packages, prefer the highest semantic version instead
+          # of accidentally rebuilding an older ZIP that sorts first alphabetically.
+          import re
+
+          def version_tuple(name: str):
+              upper = name.upper()
+              match = re.search(r'V(\d+)[._-](\d+)(?:[._-](\d+))?', upper)
+              if not match:
+                  return (0, 0, 0)
+              return tuple(int(x or 0) for x in match.groups())
+
           def priority(path: Path):
               name = path.name.upper()
-              if 'ALPHAFLOW_OS_SOURCE' in name:
-                  return (0, name)
+              version = version_tuple(name)
+              newest_first = tuple(-x for x in version)
+              if name == 'ALPHAFLOW_OS_SOURCE.ZIP':
+                  return (0, newest_first, name)
               if 'ALPHAFLOW' in name and 'SOURCE' in name:
-                  return (1, name)
+                  return (1, newest_first, name)
               if 'ALPHAFLOW' in name and 'ONECLICK' in name:
-                  return (2, name)
-              return (3, name)
+                  return (2, newest_first, name)
+              return (3, newest_first, name)
 
           archives.sort(key=priority)
           queue = deque((p, 0) for p in archives)
@@ -299,7 +312,7 @@ jobs:
             find "$PROJECT_DIR/android/app/build/outputs" -maxdepth 6 -type f 2>/dev/null | sort || true
             exit 1
           }
-          FINAL_APK="$RUNNER_TEMP/ALPHAFLOW-OS-v1.1.5-debug.apk"
+          FINAL_APK="$RUNNER_TEMP/ALPHAFLOW-OS-v1.1.6-debug.apk"
           cp "$APK_PATH" "$FINAL_APK"
           echo "APK_PATH=$FINAL_APK" >> "$GITHUB_ENV"
           ls -lh "$FINAL_APK"
@@ -307,7 +320,7 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ALPHAFLOW-OS-v1.1.5-APK
+          name: ALPHAFLOW-OS-v1.1.6-APK
           path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 14
