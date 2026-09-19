@@ -1,4 +1,4 @@
-name: Build ALPHAFLOW OS v1.1.3 APK - ROBUST SOURCE AUTODISCOVERY
+name: Build ALPHAFLOW OS v1.1.4 APK - NODE CACHE HOTFIX
 
 on:
   workflow_dispatch:
@@ -32,8 +32,10 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22.13.1'
-          cache: npm
-          cache-dependency-path: '**/package.json'
+
+      # IMPORTANT: Do not enable setup-node npm cache here.
+      # The actual package.json/package-lock.json lives inside the source ZIP
+      # and does not exist in the checkout until a later extraction step.
 
       - name: Verify preinstalled Android SDK 36
         shell: bash
@@ -178,7 +180,7 @@ jobs:
             find "$PROJECT_DIR/android/app/build/outputs" -maxdepth 6 -type f 2>/dev/null | sort || true
             exit 1
           }
-          FINAL_APK="$RUNNER_TEMP/ALPHAFLOW-OS-v1.1.3-debug.apk"
+          FINAL_APK="$RUNNER_TEMP/ALPHAFLOW-OS-v1.1.4-debug.apk"
           cp "$APK_PATH" "$FINAL_APK"
           echo "APK_PATH=$FINAL_APK" >> "$GITHUB_ENV"
           ls -lh "$FINAL_APK"
@@ -186,7 +188,7 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ALPHAFLOW-OS-v1.1.3-APK
+          name: ALPHAFLOW-OS-v1.1.4-APK
           path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 14
