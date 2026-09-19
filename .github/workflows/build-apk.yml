@@ -1,4 +1,4 @@
-name: Build ALPHAFLOW OS v1.1.4 APK - NODE CACHE HOTFIX
+name: Build ALPHAFLOW OS v1.1.5 APK - OUTER ZIP AUTODISCOVERY
 
 on:
   workflow_dispatch:
@@ -33,9 +33,8 @@ jobs:
         with:
           node-version: '22.13.1'
 
-      # IMPORTANT: Do not enable setup-node npm cache here.
-      # The actual package.json/package-lock.json lives inside the source ZIP
-      # and does not exist in the checkout until a later extraction step.
+      # Do not enable npm cache here. The dependency files may still be inside
+      # one or two ZIP layers at this stage.
 
       - name: Verify preinstalled Android SDK 36
         shell: bash
@@ -62,61 +61,181 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo '--- Repository files (depth <= 4) ---'
-          find "$GITHUB_WORKSPACE" -maxdepth 4 -type f \
-            -not -path '*/.git/*' | sed "s#^$GITHUB_WORKSPACE/##" | sort | head -400
+          echo '--- Repository files (depth <= 5) ---'
+          find "$GITHUB_WORKSPACE" -maxdepth 5 -type f \
+            -not -path '*/.git/*' | sed "s#^$GITHUB_WORKSPACE/##" | sort | head -500
 
-      - name: Locate or extract Expo source automatically
+      - name: Locate Expo source through direct files or nested ZIPs
         shell: bash
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import shutil
+          import sys
+          import zipfile
+          from collections import deque
+          from pathlib import Path
 
-          # Mode A: user uploaded an unpacked Expo project directly to repository root.
-          if [[ -f "$GITHUB_WORKSPACE/package.json" && -f "$GITHUB_WORKSPACE/app.json" ]]; then
-            PROJECT_DIR="$GITHUB_WORKSPACE"
-            echo "Using unpacked Expo project at repository root."
-          else
-            # Mode B: preferred stable path used by ALPHAFLOW releases from v1.1.3 onward.
-            SOURCE_ZIP="$GITHUB_WORKSPACE/projects/ALPHAFLOW_OS_SOURCE.zip"
+          workspace = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          runner_temp = Path(os.environ['RUNNER_TEMP']).resolve()
+          work = runner_temp / 'alphaflow_discovery'
+          result_file = runner_temp / 'alphaflow_project_dir.txt'
 
-            # Mode C: compatibility fallback for older versioned source ZIP names.
-            if [[ ! -f "$SOURCE_ZIP" ]]; then
-              SOURCE_ZIP="$(find "$GITHUB_WORKSPACE" -type f \( \
-                -iname 'ALPHAFLOW*SOURCE*.zip' -o \
-                -iname '*ALPHAFLOW*SOURCE*.zip' \
-              \) -not -path '*/.git/*' | sort | head -1 || true)"
-            fi
+          if work.exists():
+              shutil.rmtree(work)
+          work.mkdir(parents=True, exist_ok=True)
 
-            if [[ -z "${SOURCE_ZIP:-}" || ! -f "$SOURCE_ZIP" ]]; then
-              echo 'ERROR: No ALPHAFLOW Expo source was found.'
-              echo 'Expected preferred file: projects/ALPHAFLOW_OS_SOURCE.zip'
-              echo 'Upload ALL contents extracted from the ONECLICK package, not only build-apk.yml.'
-              echo 'ZIP files currently in repository:'
-              find "$GITHUB_WORKSPACE" -type f -iname '*.zip' -not -path '*/.git/*' -print || true
-              exit 1
-            fi
+          MAX_DEPTH = 4
+          MAX_ARCHIVES = 24
+          MAX_FILES_PER_ARCHIVE = 8000
+          MAX_UNCOMPRESSED_BYTES = 700 * 1024 * 1024
 
-            echo "Source ZIP selected: ${SOURCE_ZIP#$GITHUB_WORKSPACE/}"
-            rm -rf "$RUNNER_TEMP/alphaflow_source"
-            mkdir -p "$RUNNER_TEMP/alphaflow_source"
-            unzip -q "$SOURCE_ZIP" -d "$RUNNER_TEMP/alphaflow_source"
+          def project_score(directory: Path):
+              pkg_file = directory / 'package.json'
+              app_file = directory / 'app.json'
+              if not pkg_file.is_file() or not app_file.is_file():
+                  return None
+              try:
+                  pkg = json.loads(pkg_file.read_text(encoding='utf-8'))
+                  app = json.loads(app_file.read_text(encoding='utf-8'))
+              except Exception:
+                  return None
+              expo = app.get('expo', {}) if isinstance(app, dict) else {}
+              score = 0
+              if pkg.get('name') == 'alphaflow-os':
+                  score += 10
+              if expo.get('slug') == 'alphaflow-os':
+                  score += 10
+              if expo.get('android', {}).get('package') == 'com.alphaflow.os':
+                  score += 5
+              return score if score > 0 else None
 
-            PROJECT_DIR="$(find "$RUNNER_TEMP/alphaflow_source" -type f -name package.json \
-              -not -path '*/node_modules/*' -printf '%h\n' | head -1 || true)"
-          fi
+          def find_project(root: Path):
+              candidates = []
+              direct_score = project_score(root)
+              if direct_score is not None:
+                  candidates.append((direct_score + 100, root))
+              for pkg in root.rglob('package.json'):
+                  if 'node_modules' in pkg.parts or '.git' in pkg.parts:
+                      continue
+                  directory = pkg.parent
+                  score = project_score(directory)
+                  if score is not None:
+                      depth = len(directory.relative_to(root).parts)
+                      candidates.append((score - depth, directory))
+              if not candidates:
+                  return None
+              candidates.sort(key=lambda item: (-item[0], str(item[1])))
+              return candidates[0][1].resolve()
 
-          test -n "${PROJECT_DIR:-}" || {
-            echo 'ERROR: package.json not found in ALPHAFLOW source.'
+          def safe_extract(archive: Path, destination: Path):
+              with zipfile.ZipFile(archive) as zf:
+                  infos = zf.infolist()
+                  if len(infos) > MAX_FILES_PER_ARCHIVE:
+                      raise RuntimeError(f'too many files ({len(infos)})')
+                  total = sum(max(0, i.file_size) for i in infos)
+                  if total > MAX_UNCOMPRESSED_BYTES:
+                      raise RuntimeError(f'uncompressed size too large ({total} bytes)')
+                  destination.mkdir(parents=True, exist_ok=True)
+                  dest_resolved = destination.resolve()
+                  for info in infos:
+                      target = (destination / info.filename).resolve()
+                      if target != dest_resolved and dest_resolved not in target.parents:
+                          raise RuntimeError(f'unsafe ZIP path: {info.filename}')
+                  zf.extractall(destination)
+
+          # Mode A: project is already unpacked in repository.
+          project = find_project(workspace)
+          if project is not None:
+              print(f'Using unpacked ALPHAFLOW project: {project}')
+              result_file.write_text(str(project), encoding='utf-8')
+              sys.exit(0)
+
+          # Modes B/C/D: inner SOURCE ZIP, versioned SOURCE ZIP, or outer ONECLICK ZIP.
+          archives = []
+          preferred = workspace / 'projects' / 'ALPHAFLOW_OS_SOURCE.zip'
+          if preferred.is_file():
+              archives.append(preferred)
+
+          for path in workspace.rglob('*.zip'):
+              if '.git' in path.parts:
+                  continue
+              resolved = path.resolve()
+              if resolved not in [p.resolve() for p in archives]:
+                  archives.append(resolved)
+
+          # Prefer SOURCE archives, then ONECLICK archives, then any remaining ZIP.
+          def priority(path: Path):
+              name = path.name.upper()
+              if 'ALPHAFLOW_OS_SOURCE' in name:
+                  return (0, name)
+              if 'ALPHAFLOW' in name and 'SOURCE' in name:
+                  return (1, name)
+              if 'ALPHAFLOW' in name and 'ONECLICK' in name:
+                  return (2, name)
+              return (3, name)
+
+          archives.sort(key=priority)
+          queue = deque((p, 0) for p in archives)
+          seen = set()
+          count = 0
+
+          while queue and count < MAX_ARCHIVES:
+              archive, depth = queue.popleft()
+              if depth > MAX_DEPTH:
+                  continue
+              try:
+                  key = (str(archive.resolve()), archive.stat().st_size)
+              except OSError:
+                  continue
+              if key in seen:
+                  continue
+              seen.add(key)
+              count += 1
+              destination = work / f'archive_{count:02d}_depth_{depth}'
+              print(f'Extracting depth={depth}: {archive}')
+              try:
+                  safe_extract(archive, destination)
+              except Exception as exc:
+                  print(f'WARN: could not extract {archive}: {exc}')
+                  continue
+
+              project = find_project(destination)
+              if project is not None:
+                  print(f'ALPHAFLOW Expo project found: {project}')
+                  result_file.write_text(str(project), encoding='utf-8')
+                  sys.exit(0)
+
+              if depth < MAX_DEPTH:
+                  nested = [p.resolve() for p in destination.rglob('*.zip')]
+                  nested.sort(key=priority)
+                  for path in nested:
+                      queue.append((path, depth + 1))
+
+          print('ERROR: No valid ALPHAFLOW Expo project was found.')
+          print('Accepted upload forms:')
+          print('  1) unpacked Expo project at repo root')
+          print('  2) projects/ALPHAFLOW_OS_SOURCE.zip')
+          print('  3) ALPHAFLOW *_SOURCE*.zip anywhere in repo')
+          print('  4) ALPHAFLOW *_GITHUB_ONECLICK.zip uploaded AS-IS')
+          print('ZIP files currently visible in repository:')
+          for path in sorted(workspace.rglob('*.zip')):
+              if '.git' not in path.parts:
+                  print(' -', path.relative_to(workspace))
+          sys.exit(1)
+          PY
+
+          test -f "$RUNNER_TEMP/alphaflow_project_dir.txt" || {
+            echo 'ERROR: discovery script did not produce a project path.'
             exit 1
           }
-          test -f "$PROJECT_DIR/app.json" || {
-            echo "ERROR: app.json not found beside $PROJECT_DIR/package.json"
-            exit 1
-          }
-
+          PROJECT_DIR="$(cat "$RUNNER_TEMP/alphaflow_project_dir.txt")"
+          test -f "$PROJECT_DIR/package.json" || { echo "ERROR: package.json missing at $PROJECT_DIR"; exit 1; }
+          test -f "$PROJECT_DIR/app.json" || { echo "ERROR: app.json missing at $PROJECT_DIR"; exit 1; }
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "Expo project found at: $PROJECT_DIR"
-          echo '--- package version ---'
           node -p "require('$PROJECT_DIR/package.json').version"
 
       - name: Static preflight before npm
@@ -180,7 +299,7 @@ jobs:
             find "$PROJECT_DIR/android/app/build/outputs" -maxdepth 6 -type f 2>/dev/null | sort || true
             exit 1
           }
-          FINAL_APK="$RUNNER_TEMP/ALPHAFLOW-OS-v1.1.4-debug.apk"
+          FINAL_APK="$RUNNER_TEMP/ALPHAFLOW-OS-v1.1.5-debug.apk"
           cp "$APK_PATH" "$FINAL_APK"
           echo "APK_PATH=$FINAL_APK" >> "$GITHUB_ENV"
           ls -lh "$FINAL_APK"
@@ -188,7 +307,7 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ALPHAFLOW-OS-v1.1.4-APK
+          name: ALPHAFLOW-OS-v1.1.5-APK
           path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 14
