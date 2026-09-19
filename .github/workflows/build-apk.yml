@@ -1,4 +1,4 @@
-name: Build ALPHAFLOW OS v1.1.6 APK - TYPESCRIPT NAV HOTFIX
+name: Build ALPHAFLOW OS v1.1.7 APK - STANDALONE BUNDLE HOTFIX
 
 on:
   workflow_dispatch:
@@ -294,33 +294,98 @@ jobs:
           }
           test -f android/gradlew || { echo 'ERROR: Gradle wrapper missing after Expo prebuild'; exit 1; }
 
-      - name: Build debug APK with generated Gradle wrapper
+      - name: Verify standalone bundle configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          grep -q 'debuggableVariants = \[\]' android/app/build.gradle || {
+            echo 'ERROR: standalone Debug bundle safety patch was not generated.'
+            sed -n '/react {/,/}/p' android/app/build.gradle | head -120 || true
+            exit 1
+          }
+          echo 'Standalone bundle configuration is present.'
+
+      - name: Build standalone APK
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR/android"
           chmod +x gradlew
-          ./gradlew :app:assembleDebug --stacktrace --no-daemon
 
-      - name: Find and stage APK
+          echo '=== Attempting normal Release APK (bundled JS) ==='
+          set +e
+          ./gradlew :app:assembleRelease --stacktrace --no-daemon
+          RELEASE_STATUS=$?
+          set -e
+
+          APK_PATH=''
+          APK_KIND=''
+          if [ "$RELEASE_STATUS" -eq 0 ]; then
+            APK_PATH="$(find "$PROJECT_DIR/android/app/build/outputs/apk/release" -type f -name '*.apk' | head -1 || true)"
+            if [ -n "$APK_PATH" ]; then
+              APK_KIND='release'
+            fi
+          fi
+
+          if [ -z "$APK_PATH" ]; then
+            echo 'Release APK unavailable. Falling back to standalone bundled Debug APK.'
+            ./gradlew :app:assembleDebug --stacktrace --no-daemon
+            APK_PATH="$(find "$PROJECT_DIR/android/app/build/outputs/apk/debug" -type f -name '*.apk' | head -1 || true)"
+            APK_KIND='bundled-debug'
+          fi
+
+          test -n "$APK_PATH" || {
+            echo 'ERROR: Gradle finished without producing an APK.'
+            find "$PROJECT_DIR/android/app/build/outputs" -maxdepth 7 -type f 2>/dev/null | sort || true
+            exit 1
+          }
+
+          echo "$APK_PATH" > "$RUNNER_TEMP/alphaflow_apk_path.txt"
+          echo "$APK_KIND" > "$RUNNER_TEMP/alphaflow_apk_kind.txt"
+          ls -lh "$APK_PATH"
+
+      - name: Validate APK contains offline JavaScript bundle
         shell: bash
         run: |
           set -euo pipefail
-          APK_PATH="$(find "$PROJECT_DIR/android/app/build/outputs/apk/debug" -type f -name '*.apk' | head -1 || true)"
-          test -n "$APK_PATH" || {
-            echo 'ERROR: Gradle finished but APK was not found.'
-            find "$PROJECT_DIR/android/app/build/outputs" -maxdepth 6 -type f 2>/dev/null | sort || true
-            exit 1
-          }
-          FINAL_APK="$RUNNER_TEMP/ALPHAFLOW-OS-v1.1.6-debug.apk"
-          cp "$APK_PATH" "$FINAL_APK"
+          APK_PATH="$(cat "$RUNNER_TEMP/alphaflow_apk_path.txt")"
+          python3 - "$APK_PATH" <<'PY'
+          import sys, zipfile
+          apk=sys.argv[1]
+          with zipfile.ZipFile(apk) as zf:
+              names=set(zf.namelist())
+              required='assets/index.android.bundle'
+              if required not in names:
+                  print('ERROR: APK has no', required)
+                  print('Assets found:')
+                  for name in sorted(n for n in names if n.startswith('assets/'))[:200]:
+                      print(' -', name)
+                  raise SystemExit(1)
+              info=zf.getinfo(required)
+              if info.file_size < 1000:
+                  print('ERROR: JavaScript bundle exists but is implausibly small:', info.file_size)
+                  raise SystemExit(1)
+              print('Standalone JS bundle OK:', required, info.file_size, 'bytes')
+          PY
+
+      - name: Stage standalone APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_APK="$(cat "$RUNNER_TEMP/alphaflow_apk_path.txt")"
+          APK_KIND="$(cat "$RUNNER_TEMP/alphaflow_apk_kind.txt")"
+          FINAL_APK="$RUNNER_TEMP/ALPHAFLOW-OS-v1.1.7-standalone.apk"
+          cp "$SOURCE_APK" "$FINAL_APK"
           echo "APK_PATH=$FINAL_APK" >> "$GITHUB_ENV"
+          echo "APK_KIND=$APK_KIND" >> "$GITHUB_ENV"
+          echo "Standalone APK kind: $APK_KIND"
           ls -lh "$FINAL_APK"
 
-      - name: Upload APK artifact
+      - name: Upload standalone APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ALPHAFLOW-OS-v1.1.6-APK
+          name: ALPHAFLOW-OS-v1.1.7-STANDALONE-APK
           path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 14
